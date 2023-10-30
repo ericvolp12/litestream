@@ -116,7 +116,45 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 		}
 		slog.Info("litestream shut down")
 		return err
+	case "replicate-dir":
+		c := NewReplicateDirCommand()
+		if err := c.ParseFlags(ctx, args); err != nil {
+			return err
+		}
 
+		// Setup signal handler.
+		signalCh := signalChan()
+
+		if err := c.Run(); err != nil {
+			return err
+		}
+
+		// Wait for signal to stop program.
+		select {
+		case err = <-c.execCh:
+			slog.Info("subprocess exited, litestream shutting down")
+		case sig := <-signalCh:
+			slog.Info("signal received, litestream shutting down")
+
+			if c.cmd != nil {
+				slog.Info("sending signal to exec process")
+				if err := c.cmd.Process.Signal(sig); err != nil {
+					return fmt.Errorf("cannot signal exec process: %w", err)
+				}
+
+				slog.Info("waiting for exec process to close")
+				if err := <-c.execCh; err != nil && !strings.HasPrefix(err.Error(), "signal:") {
+					return fmt.Errorf("cannot wait for exec process: %w", err)
+				}
+			}
+		}
+
+		// Gracefully close.
+		if e := c.Close(); e != nil && err == nil {
+			err = e
+		}
+		slog.Info("litestream shut down")
+		return err
 	case "restore":
 		return (&RestoreCommand{}).Run(ctx, args)
 	case "snapshots":
@@ -145,13 +183,14 @@ Usage:
 
 The commands are:
 
-	databases    list databases specified in config file
-	generations  list available generations for a database
-	replicate    runs a server to replicate databases
-	restore      recovers database backup from a replica
-	snapshots    list available snapshots for a database
-	version      prints the binary version
-	wal          list available WAL files for a database
+	databases    	list databases specified in config file
+	generations  	list available generations for a database
+	replicate    	runs a server to replicate databases
+	replicate-dir   runs a server to replicate databases in a directory
+	restore      	recovers database backup from a replica
+	snapshots    	list available snapshots for a database
+	version      	prints the binary version
+	wal          	list available WAL files for a database
 `[1:])
 }
 
@@ -162,6 +201,11 @@ type Config struct {
 
 	// List of databases to manage.
 	DBs []*DBConfig `yaml:"dbs"`
+
+	// List of directories to monitor
+	Dirs []string `yaml:"dirs"`
+	// Root URL for directory replication
+	ReplicaRoot string `yaml:"replica-root"`
 
 	// Subcommand to execute during replication.
 	// Litestream will shutdown when subcommand exits.
