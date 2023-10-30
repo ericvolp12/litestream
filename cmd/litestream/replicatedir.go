@@ -40,7 +40,7 @@ type ReplicateDirCommand struct {
 	lk          sync.RWMutex
 	DBEntries   map[string]*DBEntry
 	DBTTL       time.Duration
-	DebounceSet map[string]struct{}
+	DebounceSet map[string]time.Time
 }
 
 func NewReplicateDirCommand() *ReplicateDirCommand {
@@ -48,7 +48,7 @@ func NewReplicateDirCommand() *ReplicateDirCommand {
 		execCh:      make(chan error),
 		DBEntries:   make(map[string]*DBEntry),
 		DBTTL:       5 * time.Minute,
-		DebounceSet: make(map[string]struct{}),
+		DebounceSet: make(map[string]time.Time),
 	}
 }
 
@@ -241,7 +241,7 @@ func (c *ReplicateDirCommand) watchDirs(dirs []string, onUpdate func(string), sh
 func (c *ReplicateDirCommand) syncDB(path string) error {
 	c.lk.RLock()
 	dbEntry, ok := c.DBEntries[path]
-	_, debounce := c.DebounceSet[path]
+	debounceUntil, debounce := c.DebounceSet[path]
 	c.lk.RUnlock()
 	if ok {
 		c.lk.Lock()
@@ -251,6 +251,9 @@ func (c *ReplicateDirCommand) syncDB(path string) error {
 	}
 
 	if debounce {
+		if time.Now().Before(debounceUntil) {
+			return nil
+		}
 		c.lk.Lock()
 		delete(c.DebounceSet, path)
 		c.lk.Unlock()
@@ -304,7 +307,7 @@ func (c *ReplicateDirCommand) expireDBs() error {
 				return fmt.Errorf("failed to close expired DB (%s): %w", path, err)
 			}
 			delete(c.DBEntries, path)
-			c.DebounceSet[path] = struct{}{}
+			c.DebounceSet[path] = time.Now().Add(time.Second * 3)
 		}
 	}
 
