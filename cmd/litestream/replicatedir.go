@@ -12,7 +12,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -38,17 +37,18 @@ type ReplicateDirCommand struct {
 	// List of managed databases specified in the config.
 	DBs []*litestream.DB
 
-	lk           sync.RWMutex
-	DBEntries    map[string]*DBEntry
-	DBTTL        time.Duration
-	DebounceList []string
+	lk          sync.RWMutex
+	DBEntries   map[string]*DBEntry
+	DBTTL       time.Duration
+	DebounceSet map[string]struct{}
 }
 
 func NewReplicateDirCommand() *ReplicateDirCommand {
 	return &ReplicateDirCommand{
-		execCh:    make(chan error),
-		DBEntries: make(map[string]*DBEntry),
-		DBTTL:     5 * time.Minute,
+		execCh:      make(chan error),
+		DBEntries:   make(map[string]*DBEntry),
+		DBTTL:       5 * time.Minute,
+		DebounceSet: make(map[string]struct{}),
 	}
 }
 
@@ -241,7 +241,7 @@ func (c *ReplicateDirCommand) watchDirs(dirs []string, onUpdate func(string), sh
 func (c *ReplicateDirCommand) syncDB(path string) error {
 	c.lk.RLock()
 	dbEntry, ok := c.DBEntries[path]
-	debounceIdx := slices.Index(c.DebounceList, path)
+	_, debounce := c.DebounceSet[path]
 	c.lk.RUnlock()
 	if ok {
 		c.lk.Lock()
@@ -250,9 +250,9 @@ func (c *ReplicateDirCommand) syncDB(path string) error {
 		return nil
 	}
 
-	if debounceIdx >= 0 {
+	if debounce {
 		c.lk.Lock()
-		c.DebounceList = append(c.DebounceList[:debounceIdx], c.DebounceList[debounceIdx+1:]...)
+		delete(c.DebounceSet, path)
 		c.lk.Unlock()
 		return nil
 	}
@@ -304,7 +304,7 @@ func (c *ReplicateDirCommand) expireDBs() error {
 				return fmt.Errorf("failed to close expired DB (%s): %w", path, err)
 			}
 			delete(c.DBEntries, path)
-			c.DebounceList = append(c.DebounceList, path)
+			c.DebounceSet[path] = struct{}{}
 		}
 	}
 
