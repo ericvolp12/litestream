@@ -66,6 +66,7 @@ func (c *ReplicateDirCommand) ParseFlags(ctx context.Context, args []string) (er
 
 	c.Config.Dirs = append(c.Config.Dirs, fs.Arg(0))
 	c.Config.ReplicaRoot = fs.Arg(1)
+	c.Config.Addr = "0.0.0.0:9032"
 
 	return nil
 }
