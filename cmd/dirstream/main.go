@@ -77,6 +77,12 @@ func main() {
 				EnvVars: []string{"DIRSTREAM_ADDR"},
 				Value:   "0.0.0.0:9032",
 			},
+			&cli.StringFlag{
+				Name:    "log-level",
+				Usage:   "Log level (debug, info, warn, error)",
+				EnvVars: []string{"DIRSTREAM_LOG_LEVEL"},
+				Value:   "warn",
+			},
 		},
 		Action: r.Run,
 	}
@@ -90,8 +96,14 @@ func main() {
 
 // Run loads all databases specified in the configuration.
 func (r *Replicator) Run(cctx *cli.Context) (err error) {
+	logLvl := new(slog.LevelVar)
+	logLvl.UnmarshalText([]byte(cctx.String("log-level")))
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
+		Level: logLvl,
+	})))
+
 	// Display version information.
-	slog.Info("dirstream starting up")
+	slog.Warn("dirstream starting up")
 
 	// Load configuration.
 	r.Config.Dirs = cctx.StringSlice("dir")
@@ -135,7 +147,7 @@ func (r *Replicator) Run(cctx *cli.Context) (err error) {
 			hostport = net.JoinHostPort("localhost", port)
 		}
 
-		slog.Info("serving metrics on", "url", fmt.Sprintf("http://%s/metrics", hostport))
+		slog.Warn("serving metrics on", "url", fmt.Sprintf("http://%s/metrics", hostport))
 		go func() {
 			http.Handle("/metrics", promhttp.Handler())
 			if err := http.ListenAndServe(r.Config.Addr, nil); err != nil {
@@ -150,10 +162,10 @@ func (r *Replicator) Run(cctx *cli.Context) (err error) {
 
 	select {
 	case <-signals:
-		slog.Info("shutting down on signal")
+		slog.Warn("shutting down on signal")
 	}
 
-	slog.Info("shutting down, waiting for workers to clean up...")
+	slog.Warn("shutting down, waiting for workers to clean up...")
 
 	// Close the watcher
 	close(shutdown)
@@ -161,7 +173,7 @@ func (r *Replicator) Run(cctx *cli.Context) (err error) {
 	// Sync and close all active DBs
 	r.Close()
 
-	slog.Info("all workers shutdown")
+	slog.Warn("all workers shutdown")
 	return nil
 }
 
@@ -203,6 +215,8 @@ func (r *Replicator) watchDirs(dirs []string, onUpdate func(string), shutdown ch
 					return
 				}
 				log.Error("watcher error", "error", err)
+			case <-shutdown:
+				return
 			}
 		}
 	}()
@@ -254,7 +268,7 @@ func (r *Replicator) syncDB(path string) error {
 		return nil
 	}
 
-	slog.Info("syncing new DB", "path", path)
+	slog.Warn("syncing new DB", "path", path)
 
 	ep, err := url.Parse(r.Config.ReplicaRoot)
 	if err != nil {
@@ -296,7 +310,7 @@ func (r *Replicator) expireDBs() error {
 
 	for path, dbEntry := range r.DBEntries {
 		if time.Now().After(dbEntry.ExpiresAt) {
-			slog.Info("closing expired DB", "path", path)
+			slog.Warn("closing expired DB", "path", path)
 			if err := dbEntry.DB.Close(); err != nil {
 				return fmt.Errorf("failed to close expired DB (%s): %w", path, err)
 			}
@@ -312,7 +326,7 @@ func (r *Replicator) shutdown() error {
 	r.lk.Lock()
 	defer r.lk.Unlock()
 
-	slog.Info("shutting down dir replication")
+	slog.Warn("shutting down dir replication")
 
 	for _, dbEntry := range r.DBEntries {
 		if err := dbEntry.DB.Close(); err != nil {
@@ -320,7 +334,7 @@ func (r *Replicator) shutdown() error {
 		}
 	}
 
-	slog.Info("all DBs closed")
+	slog.Warn("all DBs closed")
 
 	return nil
 }
