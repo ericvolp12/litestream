@@ -42,25 +42,26 @@ type Config struct {
 type Replicator struct {
 	Config Config
 
+	DBTTL        time.Duration
+	SyncInterval time.Duration
+
 	lk          sync.RWMutex
 	DBEntries   map[string]*DBEntry
-	DBTTL       time.Duration
 	DebounceSet map[string]time.Time
-
-	SeenDBs mapset.Set[string]
+	SeenDBs     mapset.Set[string]
 }
 
-func NewReplicator() *Replicator {
+func NewReplicator(ttl time.Duration, syncInterval time.Duration) *Replicator {
 	return &Replicator{
-		DBEntries:   make(map[string]*DBEntry),
-		DBTTL:       5 * time.Minute,
-		DebounceSet: make(map[string]time.Time),
-		SeenDBs:     mapset.NewSet[string](),
+		DBEntries:    make(map[string]*DBEntry),
+		DBTTL:        ttl,
+		SyncInterval: syncInterval,
+		DebounceSet:  make(map[string]time.Time),
+		SeenDBs:      mapset.NewSet[string](),
 	}
 }
 
 func main() {
-	r := NewReplicator()
 	app := &cli.App{
 		Name:  "dirstream",
 		Usage: "Replicate SQLite databases in a directory to S3",
@@ -77,6 +78,18 @@ func main() {
 				EnvVars:  []string{"DIRSTREAM_REPLICA_ROOT"},
 				Required: true,
 			},
+			&cli.DurationFlag{
+				Name:    "db-ttl",
+				Usage:   "Time to live for a database before it is closed",
+				EnvVars: []string{"DIRSTREAM_DB_TTL"},
+				Value:   2 * time.Minute,
+			},
+			&cli.DurationFlag{
+				Name:    "sync-interval",
+				Usage:   "How frequently active DBs should be synced",
+				EnvVars: []string{"DIRSTREAM_SYNC_INTERVAL"},
+				Value:   5 * time.Second,
+			},
 			&cli.StringFlag{
 				Name:    "addr",
 				Usage:   "Address to serve metrics on",
@@ -90,7 +103,7 @@ func main() {
 				Value:   "warn",
 			},
 		},
-		Action: r.Run,
+		Action: Run,
 	}
 
 	if err := app.Run(os.Args); err != nil {
@@ -101,7 +114,9 @@ func main() {
 }
 
 // Run loads all databases specified in the configuration.
-func (r *Replicator) Run(cctx *cli.Context) (err error) {
+func Run(cctx *cli.Context) (err error) {
+	r := NewReplicator(cctx.Duration("db-ttl"), cctx.Duration("sync-interval"))
+
 	logLvl := new(slog.LevelVar)
 	logLvl.UnmarshalText([]byte(cctx.String("log-level")))
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
@@ -109,7 +124,14 @@ func (r *Replicator) Run(cctx *cli.Context) (err error) {
 	})))
 
 	// Display version information.
-	slog.Warn("dirstream starting up")
+	slog.Warn("dirstream starting up",
+		"target_directories", cctx.StringSlice("dir"),
+		"replica_root", cctx.String("replica-root"),
+		"db_ttl", cctx.Duration("db-ttl").String(),
+		"sync_interval", cctx.Duration("sync-interval").String(),
+		"metrics_addr", cctx.String("addr"),
+		"log_level", cctx.String("log-level"),
+	)
 
 	// Load configuration.
 	r.Config.Dirs = cctx.StringSlice("dir")
@@ -293,13 +315,12 @@ func (r *Replicator) syncDB(path string) error {
 	}
 
 	dbConfig := DBConfig{Path: path}
-	syncInterval := time.Second * 5
 	dbConfig.Replicas = append(dbConfig.Replicas, &ReplicaConfig{
 		Type:         "s3",
 		Endpoint:     fmt.Sprintf("%s://%s", ep.Scheme, ep.Host),
 		Bucket:       strings.TrimPrefix(ep.Path, "/"),
 		Path:         filepath.Base(path),
-		SyncInterval: &syncInterval,
+		SyncInterval: &r.SyncInterval,
 	})
 
 	db, err := NewDBFromConfig(&dbConfig)
