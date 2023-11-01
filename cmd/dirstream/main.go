@@ -272,7 +272,7 @@ func (r *Replicator) watchDirs(dirs []string, onUpdate func(string), shutdown ch
 			}
 
 			if d.IsDir() {
-				return watcher.Add(path)
+				return watcher.AddWith(path, fsnotify.WithBufferSize(1<<20))
 			}
 			return nil
 		})

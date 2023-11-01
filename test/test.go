@@ -17,7 +17,7 @@ const (
 	DBCount          = 100_000
 	ActiveDBCount    = 1_000
 	UpdateInterval   = 5 * time.Second
-	RotationInterval = 3 * time.Minute
+	RotationInterval = 1 * time.Minute
 	MaxConcurrency   = 200 // limit the number of simultaneous goroutines
 )
 
