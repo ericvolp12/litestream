@@ -17,8 +17,11 @@ import (
 
 	"github.com/benbjohnson/litestream"
 	"github.com/fsnotify/fsnotify"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/urfave/cli/v2"
+
+	mapset "github.com/deckarep/golang-set/v2"
 )
 
 type DBEntry struct {
@@ -43,6 +46,8 @@ type Replicator struct {
 	DBEntries   map[string]*DBEntry
 	DBTTL       time.Duration
 	DebounceSet map[string]time.Time
+
+	SeenDBs mapset.Set[string]
 }
 
 func NewReplicator() *Replicator {
@@ -50,6 +55,7 @@ func NewReplicator() *Replicator {
 		DBEntries:   make(map[string]*DBEntry),
 		DBTTL:       5 * time.Minute,
 		DebounceSet: make(map[string]time.Time),
+		SeenDBs:     mapset.NewSet[string](),
 	}
 }
 
@@ -147,9 +153,15 @@ func (r *Replicator) Run(cctx *cli.Context) (err error) {
 			hostport = net.JoinHostPort("localhost", port)
 		}
 
+		// Filter out metrics from litestream due to high cardinality (4 series per DB)
+		metricHandler := promhttp.HandlerFor(
+			NewFilteredGatherer(prometheus.DefaultGatherer, "litestream_"),
+			promhttp.HandlerOpts{},
+		)
+
 		slog.Warn("serving metrics on", "url", fmt.Sprintf("http://%s/metrics", hostport))
 		go func() {
-			http.Handle("/metrics", promhttp.Handler())
+			http.Handle("/metrics", metricHandler)
 			if err := http.ListenAndServe(r.Config.Addr, nil); err != nil {
 				slog.Error("cannot start metrics server", "error", err)
 			}
@@ -207,7 +219,12 @@ func (r *Replicator) watchDirs(dirs []string, onUpdate func(string), shutdown ch
 					event.Op&fsnotify.Create == fsnotify.Create) &&
 					!strings.HasPrefix(filepath.Base(event.Name), ".") &&
 					strings.HasSuffix(event.Name, ".sqlite") {
-					log.Info("file modified", "filename", event.Name)
+					log.Debug("file modified", "filename", event.Name)
+
+					if unseen := r.SeenDBs.Add(event.Name); unseen {
+						dbsSeenCounter.Inc()
+					}
+
 					onUpdate(event.Name)
 				}
 			case err, ok := <-watcher.Errors:
@@ -294,6 +311,8 @@ func (r *Replicator) syncDB(path string) error {
 		return fmt.Errorf("failed to open DB for sync (%s): %w", path, err)
 	}
 
+	activeDBGauge.Inc()
+
 	r.lk.Lock()
 	r.DBEntries[path] = &DBEntry{
 		DB:        db,
@@ -315,6 +334,7 @@ func (r *Replicator) expireDBs() error {
 				return fmt.Errorf("failed to close expired DB (%s): %w", path, err)
 			}
 			delete(r.DBEntries, path)
+			activeDBGauge.Dec()
 			r.DebounceSet[path] = time.Now().Add(time.Second * 3)
 		}
 	}

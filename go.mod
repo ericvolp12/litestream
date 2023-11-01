@@ -11,12 +11,14 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.19.1
 	github.com/aws/aws-sdk-go-v2/credentials v1.13.43
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.40.2
+	github.com/deckarep/golang-set/v2 v2.3.1
 	github.com/fsnotify/fsnotify v1.7.0
 	github.com/mattn/go-shellwords v1.0.12
 	github.com/mattn/go-sqlite3 v1.14.17
 	github.com/pierrec/lz4/v4 v4.1.18
 	github.com/pkg/sftp v1.13.5
 	github.com/prometheus/client_golang v1.16.0
+	github.com/prometheus/client_model v0.4.0
 	github.com/urfave/cli/v2 v2.25.7
 	golang.org/x/crypto v0.12.0
 	golang.org/x/sync v0.3.0
@@ -59,7 +61,6 @@ require (
 	github.com/kr/fs v0.1.0 // indirect
 	github.com/mattn/go-ieproxy v0.0.11 // indirect
 	github.com/matttproud/golang_protobuf_extensions v1.0.4 // indirect
-	github.com/prometheus/client_model v0.4.0 // indirect
 	github.com/prometheus/common v0.44.0 // indirect
 	github.com/prometheus/procfs v0.11.1 // indirect
 	github.com/russross/blackfriday/v2 v2.1.0 // indirect
