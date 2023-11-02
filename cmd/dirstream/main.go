@@ -36,14 +36,17 @@ type Config struct {
 	ReplicaRoot string
 	// Address for metrics server
 	Addr string
+	// DBTTL is the time to live for a database before it is closed.
+	DBTTL time.Duration
+	// SyncInterval is the interval at which active databases are synced.
+	SyncInterval time.Duration
+	// MaxActiveDBs is the maximum number of active databases to keep open.
+	MaxActiveDBs int
 }
 
 // ReplicateCommand represents a command that continuously replicates SQLite databases.
 type Replicator struct {
 	Config Config
-
-	DBTTL        time.Duration
-	SyncInterval time.Duration
 
 	lk          sync.RWMutex
 	DBEntries   map[string]*DBEntry
@@ -51,13 +54,13 @@ type Replicator struct {
 	SeenDBs     mapset.Set[string]
 }
 
-func NewReplicator(ttl time.Duration, syncInterval time.Duration) *Replicator {
+func NewReplicator(config Config) *Replicator {
 	return &Replicator{
-		DBEntries:    make(map[string]*DBEntry),
-		DBTTL:        ttl,
-		SyncInterval: syncInterval,
-		DebounceSet:  make(map[string]time.Time),
-		SeenDBs:      mapset.NewSet[string](),
+		Config: config,
+
+		DBEntries:   make(map[string]*DBEntry),
+		DebounceSet: make(map[string]time.Time),
+		SeenDBs:     mapset.NewSet[string](),
 	}
 }
 
@@ -90,6 +93,12 @@ func main() {
 				EnvVars: []string{"DIRSTREAM_SYNC_INTERVAL"},
 				Value:   5 * time.Second,
 			},
+			&cli.IntFlag{
+				Name:    "max-active-dbs",
+				Usage:   "Maximum number of active databases to keep open, least recently used will be closed first",
+				EnvVars: []string{"DIRSTREAM_MAX_ACTIVE_DBS"},
+				Value:   2_000,
+			},
 			&cli.StringFlag{
 				Name:    "addr",
 				Usage:   "Address to serve metrics on",
@@ -115,8 +124,6 @@ func main() {
 
 // Run loads all databases specified in the configuration.
 func Run(cctx *cli.Context) (err error) {
-	r := NewReplicator(cctx.Duration("db-ttl"), cctx.Duration("sync-interval"))
-
 	logLvl := new(slog.LevelVar)
 	logLvl.UnmarshalText([]byte(cctx.String("log-level")))
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
@@ -133,10 +140,26 @@ func Run(cctx *cli.Context) (err error) {
 		"log_level", cctx.String("log-level"),
 	)
 
+	dirs := []string{}
+	for _, dir := range cctx.StringSlice("dir") {
+		if dir, err = filepath.Abs(dir); err != nil {
+			return fmt.Errorf("failed to resolve directory path (%s): %w", dir, err)
+		}
+		dirs = append(dirs, dir)
+	}
+
 	// Load configuration.
-	r.Config.Dirs = cctx.StringSlice("dir")
-	r.Config.ReplicaRoot = cctx.String("replica-root")
-	r.Config.Addr = cctx.String("addr")
+	conf := Config{
+		Dirs:         dirs,
+		ReplicaRoot:  cctx.String("replica-root"),
+		Addr:         cctx.String("addr"),
+		DBTTL:        cctx.Duration("db-ttl"),
+		SyncInterval: cctx.Duration("sync-interval"),
+		MaxActiveDBs: cctx.Int("max-active-dbs"),
+	}
+
+	// Initialize replicator
+	r := NewReplicator(conf)
 
 	// Discover databases.
 	if len(r.Config.Dirs) == 0 {
@@ -262,10 +285,6 @@ func (r *Replicator) watchDirs(dirs []string, onUpdate func(string), shutdown ch
 
 	// Add initial directories to the watcher.
 	for _, dir := range dirs {
-		// Resolve directory path.
-		if dir, err = filepath.Abs(dir); err != nil {
-			return err
-		}
 		err = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
 			if err != nil {
 				return err
@@ -292,7 +311,7 @@ func (r *Replicator) syncDB(path string) error {
 	r.lk.RUnlock()
 	if ok {
 		r.lk.Lock()
-		dbEntry.ExpiresAt = time.Now().Add(r.DBTTL)
+		dbEntry.ExpiresAt = time.Now().Add(r.Config.DBTTL)
 		r.lk.Unlock()
 		return nil
 	}
@@ -319,13 +338,18 @@ func (r *Replicator) syncDB(path string) error {
 		Type:         "s3",
 		Endpoint:     fmt.Sprintf("%s://%s", ep.Scheme, ep.Host),
 		Bucket:       strings.TrimPrefix(ep.Path, "/"),
-		Path:         filepath.Base(path),
-		SyncInterval: &r.SyncInterval,
+		Path:         r.getRelativePath(path),
+		SyncInterval: &r.Config.SyncInterval,
 	})
 
 	db, err := NewDBFromConfig(&dbConfig)
 	if err != nil {
 		return fmt.Errorf("failed to init DB from config for (%s): %w", path, err)
+	}
+
+	_, err = r.evictIfNecessary()
+	if err != nil {
+		return fmt.Errorf("failed to evict LRU DB: %w", err)
 	}
 
 	if err := db.Open(); err != nil {
@@ -337,11 +361,36 @@ func (r *Replicator) syncDB(path string) error {
 	r.lk.Lock()
 	r.DBEntries[path] = &DBEntry{
 		DB:        db,
-		ExpiresAt: time.Now().Add(r.DBTTL),
+		ExpiresAt: time.Now().Add(r.Config.DBTTL),
 	}
 	r.lk.Unlock()
 
 	return nil
+}
+
+func (r *Replicator) evictIfNecessary() (bool, error) {
+	r.lk.Lock()
+	defer r.lk.Unlock()
+	evicted := false
+	if len(r.DBEntries) >= r.Config.MaxActiveDBs {
+		// Close the least recently used DB.
+		var lruPath string
+		var lruExpiresAt time.Time
+		for path, dbEntry := range r.DBEntries {
+			if lruExpiresAt.IsZero() || dbEntry.ExpiresAt.Before(lruExpiresAt) {
+				lruPath = path
+				lruExpiresAt = dbEntry.ExpiresAt
+			}
+		}
+		slog.Warn("closing least recently used DB", "path", lruPath)
+		if err := r.DBEntries[lruPath].DB.Close(); err != nil {
+			return evicted, fmt.Errorf("failed to close least recently used DB (%s): %w", lruPath, err)
+		}
+		delete(r.DBEntries, lruPath)
+		activeDBGauge.Dec()
+		evicted = true
+	}
+	return evicted, nil
 }
 
 func (r *Replicator) expireDBs() error {
@@ -378,4 +427,22 @@ func (r *Replicator) shutdown() error {
 	slog.Warn("all DBs closed")
 
 	return nil
+}
+
+func (r *Replicator) getRelativePath(path string) string {
+	// Match the longest prefix of the path to one of the configured directories.
+	var dir string
+	for _, d := range r.Config.Dirs {
+		if strings.HasPrefix(path, d) && len(d) > len(dir) {
+			dir = d
+		}
+	}
+
+	// If no directory matched, return the full path.
+	if dir == "" {
+		return path
+	}
+
+	// Otherwise, return the relative path.
+	return strings.TrimPrefix(path, dir)
 }

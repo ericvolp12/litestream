@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -13,7 +15,8 @@ import (
 )
 
 const (
-	DBPrefix         = "dbs/testdb_"
+	PathPrefix       = "dbs"
+	DBPrefix         = "testdb_"
 	DBCount          = 100_000
 	ActiveDBCount    = 1_000
 	UpdateInterval   = 5 * time.Second
@@ -29,6 +32,11 @@ func initializeDB(dbName string, wg *sync.WaitGroup) {
 
 	// Acquire a slot from the semaphore
 	sem.Acquire(context.Background(), 1)
+
+	// Create parent directories if they don't exist
+	if err := os.MkdirAll(filepath.Dir(dbName), 0755); err != nil {
+		log.Fatalf("Failed to create parent directories: %v", err)
+	}
 
 	db, err := sql.Open("sqlite3", dbName)
 	if err != nil {
@@ -74,7 +82,7 @@ func main() {
 	// Initialize all databases
 	for i := 1; i <= DBCount; i++ {
 		wg.Add(1)
-		go initializeDB(fmt.Sprintf("%s%d.sqlite", DBPrefix, i), &wg)
+		go initializeDB(generateDBPath(i), &wg)
 	}
 
 	wg.Wait() // wait for all initialization to complete
@@ -88,7 +96,7 @@ func main() {
 		for time.Now().Before(endTime) {
 			for i := startIdx; i < startIdx+ActiveDBCount && i <= DBCount; i++ {
 				wg.Add(1)
-				go updateDB(fmt.Sprintf("%s%d.sqlite", DBPrefix, i), &wg)
+				go updateDB(generateDBPath(i), &wg)
 			}
 
 			wg.Wait() // Wait for all updates to finish
@@ -101,4 +109,8 @@ func main() {
 			startIdx = 1
 		}
 	}
+}
+
+func generateDBPath(i int) string {
+	return fmt.Sprintf("%s/%d/%s%d.sqlite", PathPrefix, i%100, DBPrefix, i)
 }
