@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
 	"fmt"
 	"log"
@@ -46,7 +47,10 @@ func initializeDB(dbName string, wg *sync.WaitGroup) {
 	defer sem.Release(1)
 
 	_, err = db.Exec(`PRAGMA journal_mode=WAL;
-                      CREATE TABLE IF NOT EXISTS test_table (id INTEGER PRIMARY KEY, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP);`)
+					  PRAGMA busy_timeout=5000;
+					  PRAGMA wal_autocheckpoint=0;
+					  PRAGMA synchronous=NORMAL;
+                      CREATE TABLE IF NOT EXISTS test_table (id INTEGER PRIMARY KEY, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, content TEXT);`)
 	if err != nil {
 		log.Fatalf("Failed to create table: %v", err)
 	}
@@ -69,7 +73,15 @@ func updateDB(dbName string, wg *sync.WaitGroup) {
 		}
 		defer db.Close()
 
-		_, err = db.Exec("INSERT INTO test_table (timestamp) VALUES (datetime('now'));")
+		randomBytes := make([]byte, 3000)
+		_, err = rand.Read(randomBytes)
+		if err != nil {
+			log.Fatalf("Failed to generate random content: %v", err)
+		}
+
+		randomContent := string(randomBytes)
+
+		_, err = db.Exec("INSERT INTO test_table (timestamp, content) VALUES (datetime('now'), ?);", randomContent)
 		if err != nil {
 			log.Fatalf("Failed to insert record: %v", err)
 		}

@@ -6,63 +6,16 @@ import (
 	"net"
 	"net/http"
 	_ "net/http/pprof"
-	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
-	"sync"
 	"syscall"
 	"time"
 
-	"github.com/benbjohnson/litestream"
-	"github.com/fsnotify/fsnotify"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/urfave/cli/v2"
-
-	mapset "github.com/deckarep/golang-set/v2"
 )
-
-type DBEntry struct {
-	DB        *litestream.DB
-	ExpiresAt time.Time
-}
-
-type Config struct {
-	// List of directories to monitor
-	Dirs []string
-	// Root URL for directory replication
-	ReplicaRoot string
-	// Address for metrics server
-	Addr string
-	// DBTTL is the time to live for a database before it is closed.
-	DBTTL time.Duration
-	// SyncInterval is the interval at which active databases are synced.
-	SyncInterval time.Duration
-	// MaxActiveDBs is the maximum number of active databases to keep open.
-	MaxActiveDBs int
-}
-
-// ReplicateCommand represents a command that continuously replicates SQLite databases.
-type Replicator struct {
-	Config Config
-
-	lk          sync.RWMutex
-	DBEntries   map[string]*DBEntry
-	DebounceSet map[string]time.Time
-	SeenDBs     mapset.Set[string]
-}
-
-func NewReplicator(config Config) *Replicator {
-	return &Replicator{
-		Config: config,
-
-		DBEntries:   make(map[string]*DBEntry),
-		DebounceSet: make(map[string]time.Time),
-		SeenDBs:     mapset.NewSet[string](),
-	}
-}
 
 func main() {
 	app := &cli.App{
@@ -171,8 +124,8 @@ func Run(cctx *cli.Context) (err error) {
 	shutdown := make(chan struct{})
 	go func() {
 		if err := r.watchDirs(r.Config.Dirs, func(path string) {
-			if err := r.syncDB(path); err != nil {
-				slog.Error("failed to sync DB", "error", err)
+			if err := r.processDBUpdate(path); err != nil {
+				slog.Error("failed to process DB Update", "error", err)
 			}
 		}, shutdown); err != nil {
 			slog.Error("failed to watch directories", "error", err)
@@ -232,217 +185,4 @@ func Run(cctx *cli.Context) (err error) {
 
 	slog.Warn("all workers shutdown")
 	return nil
-}
-
-// Close closes all open databases.
-func (r *Replicator) Close() (err error) {
-	err = r.shutdown()
-	if err != nil {
-		slog.Error("failed to shutdown", "error", err)
-	}
-	return err
-}
-
-func (r *Replicator) watchDirs(dirs []string, onUpdate func(string), shutdown chan struct{}) error {
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		return err
-	}
-	defer watcher.Close()
-
-	log := slog.With("source", "watcher")
-
-	go func() {
-		for {
-			select {
-			case event, ok := <-watcher.Events:
-				if !ok {
-					return
-				}
-				// Only sync on file creation or modification of non `.` prefixed files with `.sqlite` suffix.
-				if (event.Op&fsnotify.Write == fsnotify.Write ||
-					event.Op&fsnotify.Create == fsnotify.Create) &&
-					!strings.HasPrefix(filepath.Base(event.Name), ".") &&
-					strings.HasSuffix(event.Name, ".sqlite") {
-					log.Debug("file modified", "filename", event.Name)
-
-					if unseen := r.SeenDBs.Add(event.Name); unseen {
-						dbsSeenCounter.Inc()
-					}
-
-					onUpdate(event.Name)
-				}
-			case err, ok := <-watcher.Errors:
-				if !ok {
-					return
-				}
-				log.Error("watcher error", "error", err)
-			case <-shutdown:
-				return
-			}
-		}
-	}()
-
-	// Add initial directories to the watcher.
-	for _, dir := range dirs {
-		err = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
-			if err != nil {
-				return err
-			}
-
-			if d.IsDir() {
-				return watcher.AddWith(path, fsnotify.WithBufferSize(1<<20))
-			}
-			return nil
-		})
-		if err != nil {
-			return err
-		}
-	}
-
-	<-shutdown
-	return nil
-}
-
-func (r *Replicator) syncDB(path string) error {
-	r.lk.RLock()
-	dbEntry, ok := r.DBEntries[path]
-	debounceUntil, debounce := r.DebounceSet[path]
-	r.lk.RUnlock()
-	if ok {
-		r.lk.Lock()
-		dbEntry.ExpiresAt = time.Now().Add(r.Config.DBTTL)
-		r.lk.Unlock()
-		return nil
-	}
-
-	if debounce {
-		if time.Now().Before(debounceUntil) {
-			return nil
-		}
-		r.lk.Lock()
-		delete(r.DebounceSet, path)
-		r.lk.Unlock()
-		return nil
-	}
-
-	slog.Warn("syncing new DB", "path", path)
-
-	ep, err := url.Parse(r.Config.ReplicaRoot)
-	if err != nil {
-		return fmt.Errorf("failed to parse replica root URL (%s): %w", r.Config.ReplicaRoot, err)
-	}
-
-	dbConfig := DBConfig{Path: path}
-	dbConfig.Replicas = append(dbConfig.Replicas, &ReplicaConfig{
-		Type:         "s3",
-		Endpoint:     fmt.Sprintf("%s://%s", ep.Scheme, ep.Host),
-		Bucket:       strings.TrimPrefix(ep.Path, "/"),
-		Path:         r.getRelativePath(path),
-		SyncInterval: &r.Config.SyncInterval,
-	})
-
-	db, err := NewDBFromConfig(&dbConfig)
-	if err != nil {
-		return fmt.Errorf("failed to init DB from config for (%s): %w", path, err)
-	}
-
-	_, err = r.evictIfNecessary()
-	if err != nil {
-		return fmt.Errorf("failed to evict LRU DB: %w", err)
-	}
-
-	if err := db.Open(); err != nil {
-		return fmt.Errorf("failed to open DB for sync (%s): %w", path, err)
-	}
-
-	activeDBGauge.Inc()
-
-	r.lk.Lock()
-	r.DBEntries[path] = &DBEntry{
-		DB:        db,
-		ExpiresAt: time.Now().Add(r.Config.DBTTL),
-	}
-	r.lk.Unlock()
-
-	return nil
-}
-
-func (r *Replicator) evictIfNecessary() (bool, error) {
-	r.lk.Lock()
-	defer r.lk.Unlock()
-	evicted := false
-	if len(r.DBEntries) >= r.Config.MaxActiveDBs {
-		// Close the least recently used DB.
-		var lruPath string
-		var lruExpiresAt time.Time
-		for path, dbEntry := range r.DBEntries {
-			if lruExpiresAt.IsZero() || dbEntry.ExpiresAt.Before(lruExpiresAt) {
-				lruPath = path
-				lruExpiresAt = dbEntry.ExpiresAt
-			}
-		}
-		slog.Warn("closing least recently used DB", "path", lruPath)
-		if err := r.DBEntries[lruPath].DB.Close(); err != nil {
-			return evicted, fmt.Errorf("failed to close least recently used DB (%s): %w", lruPath, err)
-		}
-		delete(r.DBEntries, lruPath)
-		activeDBGauge.Dec()
-		evicted = true
-	}
-	return evicted, nil
-}
-
-func (r *Replicator) expireDBs() error {
-	r.lk.Lock()
-	defer r.lk.Unlock()
-
-	for path, dbEntry := range r.DBEntries {
-		if time.Now().After(dbEntry.ExpiresAt) {
-			slog.Warn("closing expired DB", "path", path)
-			if err := dbEntry.DB.Close(); err != nil {
-				return fmt.Errorf("failed to close expired DB (%s): %w", path, err)
-			}
-			delete(r.DBEntries, path)
-			activeDBGauge.Dec()
-			r.DebounceSet[path] = time.Now().Add(time.Second * 3)
-		}
-	}
-
-	return nil
-}
-
-func (r *Replicator) shutdown() error {
-	r.lk.Lock()
-	defer r.lk.Unlock()
-
-	slog.Warn("shutting down dir replication")
-
-	for _, dbEntry := range r.DBEntries {
-		if err := dbEntry.DB.Close(); err != nil {
-			slog.Error("failed to close DB", "error", err)
-		}
-	}
-
-	slog.Warn("all DBs closed")
-
-	return nil
-}
-
-func (r *Replicator) getRelativePath(path string) string {
-	// Match the longest prefix of the path to one of the configured directories.
-	var dir string
-	for _, d := range r.Config.Dirs {
-		if strings.HasPrefix(path, d) && len(d) > len(dir) {
-			dir = d
-		}
-	}
-
-	// If no directory matched, return the full path.
-	if dir == "" {
-		return path
-	}
-
-	// Otherwise, return the relative path.
-	return strings.TrimPrefix(path, dir)
 }
