@@ -85,7 +85,7 @@ func (r *Replicator) watchDirs(dirs []string, onUpdate func(string), shutdown ch
 					event.Op&fsnotify.Create == fsnotify.Create) &&
 					!strings.HasPrefix(filepath.Base(event.Name), ".") &&
 					strings.HasSuffix(event.Name, ".sqlite") {
-					log.Warn("file modified", "filename", event.Name)
+					log.Debug("file modified", "filename", event.Name)
 
 					if unseen := r.SeenDBs.Add(event.Name); unseen {
 						dbsSeenCounter.Inc()
@@ -146,23 +146,9 @@ func (r *Replicator) syncNewDB(db *litestream.DB, path string) error {
 	r.lk.Lock()
 	defer r.lk.Unlock()
 
-	// Check if we need to close an existing DB.
-	if len(r.DBEntries) >= r.Config.MaxActiveDBs {
-		// Close the least recently used DB.
-		var lruPath string
-		var lruExpiresAt time.Time
-		for path, dbEntry := range r.DBEntries {
-			if lruExpiresAt.IsZero() || dbEntry.ExpiresAt.Before(lruExpiresAt) {
-				lruPath = path
-				lruExpiresAt = dbEntry.ExpiresAt
-			}
-		}
-		slog.Warn("closing least recently used DB", "path", lruPath)
-		if err := r.DBEntries[lruPath].DB.Close(); err != nil {
-			return fmt.Errorf("failed to close least recently used DB (%s): %w", lruPath, err)
-		}
-		delete(r.DBEntries, lruPath)
-		activeDBGauge.Dec()
+	_, err := r.evictLRU()
+	if err != nil {
+		return fmt.Errorf("failed to evict LRU DB: %w", err)
 	}
 
 	if err := db.Open(); err != nil {
@@ -239,16 +225,49 @@ func (r *Replicator) expireDBs() error {
 	for path, dbEntry := range r.DBEntries {
 		if time.Now().After(dbEntry.ExpiresAt) {
 			slog.Warn("closing expired DB", "path", path)
-			if err := dbEntry.DB.Close(); err != nil {
-				return fmt.Errorf("failed to close expired DB (%s): %w", path, err)
+			if err := r.removeDB(dbEntry, path); err != nil {
+				return fmt.Errorf("failed to remove expired DB (%s): %w", path, err)
 			}
-			delete(r.DBEntries, path)
-			activeDBGauge.Dec()
-			r.DebounceSet[path] = time.Now().Add(time.Second * 3)
 		}
 	}
 
 	return nil
+}
+
+// removeDB removes the given DB from the active DB set and sets a debounce timer
+// ONLY CALL THIS WITH THE LOCK HELD
+func (r *Replicator) removeDB(entry *DBEntry, path string) error {
+	delete(r.DBEntries, path)
+	r.DebounceSet[path] = time.Now().Add(time.Second * 8)
+	if err := entry.DB.Close(); err != nil {
+		return fmt.Errorf("failed to close DB (%s): %w", path, err)
+	}
+	activeDBGauge.Dec()
+	return nil
+}
+
+// evictLRU evicts the least recently used DB if the active DB set is full
+// and returns true if an eviction occurred
+// ONLY CALL THIS WITH THE LOCK HELD
+func (r *Replicator) evictLRU() (bool, error) {
+	// Check if we need to close an existing DB.
+	if len(r.DBEntries) >= r.Config.MaxActiveDBs {
+		// Close the least recently used DB.
+		var lruPath string
+		var lruExpiresAt time.Time
+		for path, dbEntry := range r.DBEntries {
+			if lruExpiresAt.IsZero() || dbEntry.ExpiresAt.Before(lruExpiresAt) {
+				lruPath = path
+				lruExpiresAt = dbEntry.ExpiresAt
+			}
+		}
+		slog.Warn("closing least recently used DB", "path", lruPath, "expires_at", lruExpiresAt)
+		if err := r.removeDB(r.DBEntries[lruPath], lruPath); err != nil {
+			return false, fmt.Errorf("failed to remove least recently used DB (%s): %w", lruPath, err)
+		}
+		return true, nil
+	}
+	return false, nil
 }
 
 func (r *Replicator) shutdown() error {
